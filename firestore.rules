@@ -1,0 +1,112 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function isAdmin() { return signedIn() && exists(/databases/$(db)/documents/admins/$(uid())); }
+    function isRider() { return signedIn() && exists(/databases/$(db)/documents/riders/$(uid())); }
+    function isApprovedRider() {
+      return isRider() &&
+        get(/databases/$(db)/documents/riders/$(uid())).data.status == "approved";
+    }
+
+    // POS / restaurant staff account (create the doc by hand in the console, like admins)
+    function isStaff() { return signedIn() && exists(/databases/$(db)/documents/staff/$(uid())); }
+
+    // which fields a rider-profile update touches
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    // a rider may only flip a document field to "submitted", and never once it is "verified" (or "na" = not required)
+    function kycOk(field) {
+      return !changed().hasAny([field])
+        || (request.resource.data[field] == "submitted" && !(resource.data[field] in ["verified", "na"]));
+    }
+
+    // Admins: only readable by the user themself. Create admins by hand in the console.
+    match /admins/{id} {
+      allow read: if signedIn() && uid() == id;
+      allow write: if false;
+    }
+
+    match /staff/{id} {
+      allow read: if signedIn() && uid() == id;
+      allow write: if false;
+    }
+
+    // Settings (WhatsApp number that receives rider photos). Admin only, for reading AND writing.
+    match /settings/{id} {
+      allow read, write: if isAdmin();
+    }
+
+    // Counter used to hand out rider IDs (AK-0001, AK-0002 ...)
+    match /meta/{id} {
+      allow read, write: if isAdmin();
+    }
+
+    match /riders/{id} {
+      allow create: if signedIn() && uid() == id
+        && request.resource.data.status == "pending"
+        && request.resource.data.online == false
+        && request.resource.data.emailVerified == false
+        && request.resource.data.kycIdentity == "none"
+        // licence is needed only for motorbike riders; bicycle / on-foot get "na"
+        && request.resource.data.kycLicense == (request.resource.data.vehicle == "motorbike" ? "none" : "na");
+      allow read: if signedIn() && (uid() == id || isAdmin());
+      allow update: if isAdmin()
+        || (signedIn() && uid() == id && (
+             // live location / online switch
+             changed().hasOnly(["lat", "lng", "online", "updatedAt"])
+             // submitting identity proof / licence for review
+             || (changed().hasOnly(["kycIdentity", "kycLicense"]) && kycOk("kycIdentity") && kycOk("kycLicense"))
+             // marking the email as verified (only if Firebase says so)
+             || (changed().hasOnly(["emailVerified", "verifiedAt"])
+                 && request.resource.data.emailVerified == true
+                 && request.auth.token.email_verified == true)
+           ));
+      allow delete: if isAdmin();
+    }
+
+    // Identity proof (any ONE government ID) + driving licence. One document each:
+    // riders/{uid}/kyc/identity and riders/{uid}/kyc/license. Photos are Cloudinary URLs.
+    match /riders/{id}/kyc/{type} {
+      allow read: if signedIn() && (uid() == id || isAdmin());
+      allow create, update: if isAdmin()
+        || (signedIn() && uid() == id
+            && type in ["identity", "license"]
+            && request.resource.data.status == "submitted"
+            && request.resource.data.keys().hasOnly(["idType", "number", "front", "back", "expiry", "status", "note", "submittedAt"])
+            && (resource == null || resource.data.status != "verified"));
+      allow delete: if isAdmin();
+    }
+
+    match /orders/{id} {
+      // Approved riders see open orders and their own; admin sees all
+      allow read: if isAdmin()
+        || (isApprovedRider() && (resource.data.status == "new" || resource.data.riderId == uid()));
+
+      // Admin or POS staff (any signed-in user that is NOT a rider) can create new orders
+      allow create: if (isAdmin() || (signedIn() && !isRider()))
+        && request.resource.data.status == "new";
+
+      // Admin; or POS staff adding a customer rating to a delivered order; or the assigned rider moving it forward.
+      // Riders may touch ONLY the listed fields (so nobody can edit fees or ratings).
+      allow update: if isAdmin()
+        || (isStaff() && resource.data.status == "delivered"
+            && changed().hasOnly(["rating", "ratingNote", "ratedAt"])
+            && request.resource.data.rating is int
+            && request.resource.data.rating >= 1 && request.resource.data.rating <= 5)
+        || (isApprovedRider() && (
+              (resource.data.status == "new"
+                && request.resource.data.status == "accepted"
+                && request.resource.data.riderId == uid()
+                && changed().hasOnly(["status", "riderId", "riderName", "riderPhone", "acceptedAt", "acceptedLat", "acceptedLng"]))
+              ||
+              (resource.data.riderId == uid()
+                && resource.data.status in ["accepted", "picked"]
+                && request.resource.data.status in ["picked", "delivered"]
+                && changed().hasOnly(["status", "pickedAt", "deliveredAt"]))
+           ));
+      allow delete: if isAdmin();
+    }
+  }
+}
